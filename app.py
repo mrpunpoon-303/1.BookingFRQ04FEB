@@ -4,7 +4,8 @@ import plotly.graph_objects as go
 import pandas as pd
 import base64
 import io
-
+import dash
+from dash import ALL
 # Initialize the Dash app
 app = Dash(__name__, 
     external_stylesheets=[
@@ -12,9 +13,6 @@ app = Dash(__name__,
     ],
     suppress_callback_exceptions=True
 )
-
-# Add this line for deployment
-server = app.server
 
 def create_frequency_table(data, period=None, start_period=None, end_period=None, max_upper=10):
     """Process data to create frequency table"""
@@ -105,13 +103,9 @@ app.layout = html.Div([
                 )
             ], className="mb-4"),
 
-            # Period Selection with placeholder dropdowns
+            # Period Selection
             html.Div([
-                html.Div(id='period-selector', className="mb-4"),
-                # Hidden placeholder dropdowns
-                dcc.Dropdown(id='selected-period', style={'display': 'none'}),
-                dcc.Dropdown(id='start-period', style={'display': 'none'}),
-                dcc.Dropdown(id='end-period', style={'display': 'none'})
+                html.Div(id='period-selector', className="mb-4")
             ], className="mb-4"),
 
             # Max Upper Bound Input
@@ -157,15 +151,26 @@ app.layout = html.Div([
 
     ], className="max-w-7xl mx-auto p-6"),
 
-    # Store components for data
+     # Store components for data
     dcc.Store(id='stored-data'),
-    dcc.Download(id="download-xlsx")
+    dcc.Download(id="download-xlsx"),
+    dcc.Loading(
+        id="loading-upload",
+        type="default",
+        children=html.Div(id="loading-output")
+    ),
+    dcc.Loading(
+        id="loading-analysis",
+        type="default",
+        children=html.Div(id="analysis-output")
+    )
 ])
 
 @app.callback(
     [Output('stored-data', 'data'),
      Output('upload-feedback', 'children'),
-     Output('upload-feedback', 'className')],
+     Output('upload-feedback', 'className'),
+     Output('loading-output', 'children')],
     Input('upload-data', 'contents'),
     State('upload-data', 'filename')
 )
@@ -175,18 +180,17 @@ def store_data(contents, filename):
 
     df, error = parse_contents(contents)
     if error:
-        return None, f"Error: {error}", "mt-2 text-red-600"
+        return None, f"Error: {error}", "mt-2 text-red-600", ""  # Added ""
     
     return {
         'data': df.to_json(date_format='iso', orient='split'),
         'filename': filename
-    }, f"File uploaded: {filename}", "mt-2 text-green-600"
+    }, f"File uploaded: {filename}", "mt-2 text-green-600", ""  # Added ""
+
+from io import StringIO
 
 @app.callback(
-    [Output('period-selector', 'children'),
-     Output('selected-period', 'style'),
-     Output('start-period', 'style'),
-     Output('end-period', 'style')],
+    Output('period-selector', 'children'),
     [Input('stored-data', 'data'),
      Input('analysis-type', 'value')]
 )
@@ -194,72 +198,68 @@ def update_period_selector(stored_data, analysis_type):
     if not stored_data:
         raise PreventUpdate
 
-    data = pd.read_json(stored_data['data'], orient='split')
+    data = pd.read_json(StringIO(stored_data['data']), orient='split')
     periods = sorted(data["Start_Date_time"].dt.to_period("M").astype(str).unique())
-    
-    if analysis_type == 'Monthly':
-        return (
-            dcc.Dropdown(
-                id='selected-period',
-                options=[{'label': p, 'value': p} for p in periods],
-                value=periods[-1],
-                className="w-full"
-            ),
-            {'display': 'block'},
-            {'display': 'none'},
-            {'display': 'none'}
+    return get_monthly_selector(periods) if analysis_type == 'Monthly' else get_range_selector(periods)
+
+def get_monthly_selector(periods):
+    return dcc.Dropdown(
+        id={'type': 'period', 'mode': 'monthly'},
+        options=[{'label': p, 'value': p} for p in periods],
+        value=periods[-1],
+        className="w-full"
+    )
+
+def get_range_selector(periods):
+    return html.Div([
+        html.Label("Start Period:", className="font-medium"),
+        dcc.Dropdown(
+            id={'type': 'period', 'mode': 'start'},
+            options=[{'label': p, 'value': p} for p in periods],
+            value=periods[0],
+            className="w-full mb-2"
+        ),
+        html.Label("End Period:", className="font-medium"),
+        dcc.Dropdown(
+            id={'type': 'period', 'mode': 'end'},
+            options=[{'label': p, 'value': p} for p in periods],
+            value=periods[-1],
+            className="w-full"
         )
-    else:
-        return (
-            html.Div([
-                dcc.Dropdown(
-                    id='start-period',
-                    options=[{'label': p, 'value': p} for p in periods],
-                    value=periods[0],
-                    className="w-full mb-2"
-                ),
-                dcc.Dropdown(
-                    id='end-period',
-                    options=[{'label': p, 'value': p} for p in periods],
-                    value=periods[-1],
-                    className="w-full"
-                )
-            ]),
-            {'display': 'none'},
-            {'display': 'block'},
-            {'display': 'block'}
-        )
+    ])
+
+
 
 @app.callback(
     [Output('histogram', 'figure'),
      Output('table-container', 'children'),
      Output('results-section', 'style'),
      Output('status-message', 'children'),
-     Output('status-message', 'className')],
+     Output('status-message', 'className'),
+     Output('analysis-output', 'children')],
     Input('run-analysis', 'n_clicks'),
     [State('stored-data', 'data'),
      State('analysis-type', 'value'),
      State('max-upper', 'value'),
-     State('selected-period', 'value'),
-     State('start-period', 'value'),
-     State('end-period', 'value')],
-    prevent_initial_call=True
+     State({'type': 'period', 'mode': ALL}, 'value')]
 )
-def update_outputs(n_clicks, stored_data, analysis_type, max_upper, selected_period, start_period, end_period):
+def update_outputs(n_clicks, stored_data, analysis_type, max_upper, period_values):
     if not n_clicks or not stored_data:
         raise PreventUpdate
 
     try:
-        data = pd.read_json(stored_data['data'], orient='split')
+        data = pd.read_json(StringIO(stored_data['data']), orient='split')
         
-        # Get frequency table based on analysis type
         if analysis_type == 'Monthly':
-            table = create_frequency_table(data, period=selected_period, max_upper=max_upper)
+            period_value = period_values[0] if period_values else None
+            if not period_value:
+                raise ValueError("Please select a period")
+            table = create_frequency_table(data, period=period_value, max_upper=max_upper)
         else:
-            table = create_frequency_table(data, start_period=start_period, end_period=end_period, max_upper=max_upper)
-
-        if table is None:
-            return dash.no_update, dash.no_update, {'display': 'none'}, "Error: No data available for selected period", "text-red-600"
+            if len(period_values) < 2:
+                raise ValueError("Please select start and end periods")
+            table = create_frequency_table(data, start_period=period_values[0], 
+                                        end_period=period_values[1], max_upper=max_upper)
 
         # Create histogram
         fig = go.Figure()
@@ -285,20 +285,25 @@ def update_outputs(n_clicks, stored_data, analysis_type, max_upper, selected_per
             mean_val = sum(freq_data) / len(freq_data)
             median_val = sorted(freq_data)[len(freq_data)//2]
             
-            # Add mean line
             fig.add_vline(x=mean_val, line_dash="dash", line_color="red",
                          annotation_text=f"Mean: {mean_val:.2f}",
                          annotation_position="top right",
                          annotation_y=1.1)
             
-            # Add median line
             fig.add_vline(x=median_val, line_dash="dash", line_color="green",
                          annotation_text=f"Median: {median_val:.2f}",
                          annotation_position="bottom right",
                          annotation_y=0.9)
 
+        # Create title with date range
+        title = 'Booking Frequency Distribution'
+        if analysis_type == 'Monthly':
+            title += f' ({period_values[0]})'
+        else:
+            title += f' ({period_values[0]} to {period_values[1]})'
+            
         fig.update_layout(
-            title='Booking Frequency Distribution',
+            title=title,
             xaxis_title='Frequency of Bookings',
             yaxis_title='Number of Students',
             height=500
@@ -321,10 +326,10 @@ def update_outputs(n_clicks, stored_data, analysis_type, max_upper, selected_per
             ])
         ], className="min-w-full divide-y divide-gray-200")
 
-        return fig, table_component, {'display': 'block'}, "Analysis completed successfully", "text-green-600"
+        return fig, table_component, {'display': 'block'}, "Analysis completed successfully", "text-green-600",""
 
     except Exception as e:
-        return dash.no_update, dash.no_update, {'display': 'none'}, f"Error: {str(e)}", "text-red-600"
+        return dash.no_update, dash.no_update, {'display': 'none'}, f"Error: {str(e)}", "text-red-600", ""
 
 @app.callback(
     Output("download-xlsx", "data"),
@@ -332,23 +337,34 @@ def update_outputs(n_clicks, stored_data, analysis_type, max_upper, selected_per
     [State('stored-data', 'data'),
      State('analysis-type', 'value'),
      State('max-upper', 'value'),
-     State('selected-period', 'value'),
-     State('start-period', 'value'),
-     State('end-period', 'value')],
+     State({'type': 'period', 'mode': ALL}, 'value')],
     prevent_initial_call=True
 )
-def export_data(n_clicks, stored_data, analysis_type, max_upper, selected_period, start_period, end_period):
+def export_data(n_clicks, stored_data, analysis_type, max_upper, period_values):
     if not n_clicks or not stored_data:
         raise PreventUpdate
 
-    data = pd.read_json(stored_data['data'], orient='split')
-    if analysis_type == 'Monthly':
-        table = create_frequency_table(data, period=selected_period, max_upper=max_upper)
-    else:
-        table = create_frequency_table(data, start_period=start_period, end_period=end_period, max_upper=max_upper)
+    try:
+        data = pd.read_json(StringIO(stored_data['data']), orient='split')
+        if analysis_type == 'Monthly':
+            period_value = period_values[0] if period_values else None
+            if not period_value:
+                raise PreventUpdate
+            table = create_frequency_table(data, period=period_value, max_upper=max_upper)
+        else:
+            if len(period_values) < 2:
+                raise PreventUpdate
+            table = create_frequency_table(data, start_period=period_values[0], 
+                                        end_period=period_values[1], max_upper=max_upper)
 
-    return dcc.send_data_frame(table.to_excel, "booking_frequency.xlsx", sheet_name="Frequency Analysis")
+        if table is None:
+            raise PreventUpdate
 
-# Modified server run line for deployment
+        return dcc.send_data_frame(table.to_excel, "booking_frequency.xlsx", sheet_name="Frequency Analysis")
+    except Exception:
+        raise PreventUpdate
+        
+server = app.server  # Add this line
+
 if __name__ == '__main__':
-    app.run_server(debug=False, host='0.0.0.0')
+    app.run_server(debug=True, port=8062)
